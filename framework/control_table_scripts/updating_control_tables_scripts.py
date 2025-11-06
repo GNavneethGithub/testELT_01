@@ -434,6 +434,336 @@ def update_audit_details(
             logger.info("Snowflake connection closed. Autocommit reset to ON.", tag=log_tag)
 
 
+@trace(logger_attr_name="logger")
+def get_backfill_records_by_status(
+    config: Dict[str, Any], 
+    logger: CustomLogger, 
+    request_status: str
+) -> Dict[str, Any]:
+    """
+    Collects all records from the backfill table for a specific PIPELINE_ID
+    and a given REQUEST_STATUS.
+
+    Parameters:
+        config (dict): The configuration dictionary. Expected to contain:
+                       - Snowflake connection params
+                       - 'pipeline_back_fill_request_db' (str)
+                       - 'pipeline_back_fill_request_sch' (str)
+                       - 'pipeline_backfill_tbl' (str)
+                       - 'PIPELINE_ID' (str): The specific pipeline ID to query for.
+        logger (CustomLogger): An instance of the custom logger.
+        request_status (str): The status to filter by (e.g., 'PENDING', 'RUNNING').
+
+    Returns:
+        dict: A dictionary containing:
+              - 'continue_dag_run' (bool): True on success, False on failure.
+              - 'error' (dict | None): Error details on failure, else None.
+              - 'data' (List[Dict[str, Any]] | None): A list of dictionaries (rows) on success.
+    """
+    log_tag = "get_backfill_records_by_status"
+    
+    return_val = {
+        "continue_dag_run": False,
+        "error": None,
+        "data": None
+    }
+    
+    conn = None
+    query_id = None
+    
+    try:
+        db_name = config.get("pipeline_back_fill_request_db")
+        schema_name = config.get("pipeline_back_fill_request_sch")
+        table_name = config.get("pipeline_backfill_tbl")
+        pipeline_id = config.get("PIPELINE_ID")
+
+        if not all([db_name, schema_name, table_name, pipeline_id, request_status]):
+            err_msg = (
+                "Missing one or more config keys: 'pipeline_back_fill_request_db', "
+                "'pipeline_back_fill_request_sch', 'pipeline_backfill_tbl', 'PIPELINE_ID', or 'request_status' is empty."
+            )
+            logger.error(err_msg, tag=log_tag)
+            return_val["error"] = {"message": err_msg, "source": log_tag}
+            return return_val
+
+        fully_qualified_name = f"{db_name}.{schema_name}.{table_name}"
+        logger.info(f"Querying {fully_qualified_name} for '{request_status}' records...", tag=log_tag)
+
+        conn_result = get_snowflake_connection(config, logger)
+        conn = conn_result.get('conn')
+        if conn_result.get('error'):
+            logger.error(
+                f"Failed to connect to Snowflake. Cannot query {fully_qualified_name}.",
+                tag=log_tag,
+                details=conn_result['error']
+            )
+            return_val["error"] = conn_result['error']
+            return return_val
+
+        with conn.cursor(DictCursor) as cursor:
+            use_db_sql = f"USE DATABASE {db_name}"
+            logger.info(f"Executing: {use_db_sql}", tag=log_tag)
+            cursor.execute(use_db_sql)
+            query_id = cursor.sfqid
+            logger.info(f"USE DATABASE successful.", tag=log_tag, details={"query_id": query_id})
+            
+            use_schema_sql = f"USE SCHEMA {schema_name}"
+            logger.info(f"Executing: {use_schema_sql}", tag=log_tag)
+            cursor.execute(use_schema_sql)
+            query_id = cursor.sfqid
+            logger.info(f"USE SCHEMA successful.", tag=log_tag, details={"query_id": query_id})
+            
+            select_sql = f"""
+            SELECT * FROM {fully_qualified_name}
+            WHERE PIPELINE_ID = %(pid)s
+            AND REQUEST_STATUS = %(status)s
+            """
+            
+            parms = {
+                "pid": pipeline_id,
+                "status": request_status.upper() # Standardizing to upper case
+            }
+
+            print_select_sql = select_sql.replace("%(pid)s", f"'{parms['pid']}'")\
+                                         .replace("%(status)s", f"'{parms['status']}'")
+            print(print_select_sql)
+            
+            logger.info(
+                f"Executing SELECT query on {fully_qualified_name}...", 
+                tag=log_tag,
+                details=parms
+            )
+            
+            cursor.execute(select_sql, parms)
+            query_id = cursor.sfqid
+            
+            results = cursor.fetchall()
+        
+        logger.info(
+            f"Successfully fetched {len(results)} records.",
+            tag=log_tag,
+            details={"query_id": query_id}
+        )
+        
+        return_val["continue_dag_run"] = True
+        return_val["data"] = results
+        return return_val
+        
+    except snowflake.connector.Error as e:
+        error_details = {
+            "message": e.msg,
+            "errno": e.errno,
+            "sqlstate": e.sqlstate,
+            "sfqid": e.sfqid
+        }
+        logger.error(
+            "A Snowflake error occurred while querying.",
+            tag=log_tag,
+            details=error_details
+        )
+        return_val["error"] = error_details
+        return return_val
+        
+    except Exception as e:
+        error_details = {
+            "message": f"A non-Snowflake error occurred: {e}",
+            "error_type": type(e).__name__
+        }
+        logger.error(
+            error_details["message"],
+            tag=log_tag,
+            details={"error_string": str(e)}
+        )
+        return_val["error"] = error_details
+        return return_val
+        
+    finally:
+        if conn:
+            conn.close()
+            logger.info("Snowflake connection closed.", tag=log_tag)
+
+
+
+
+@trace(logger_attr_name="logger")
+def update_backfill_record(
+    config: Dict[str, Any], 
+    logger: CustomLogger, 
+    back_fill_details: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Updates a record in the backfill table based on REQUEST_ID and PIPELINE_ID.
+
+    It dynamically builds the SET clause, only updating columns that
+    are provided in the 'back_fill_details' dictionary.
+
+    Parameters:
+        config (dict): The configuration dictionary.
+        logger (CustomLogger): An instance of the custom logger.
+        back_fill_details (dict): A dictionary containing 'REQUEST_ID', 
+                                  'PIPELINE_ID', and any columns to update.
+
+    Returns:
+        dict: A dictionary containing:
+              - 'continue_dag_run' (bool): True on success, False on failure.
+              - 'error' (dict | None): Error details on failure, else None.
+    """
+    log_tag = "update_backfill_record"
+    
+    return_val = {
+        "continue_dag_run": False,
+        "error": None
+    }
+    
+    conn = None
+    query_id = None
+    
+    # List of columns that are allowed to be updated
+    UPDATABLE_COLUMNS = [
+        "REQUEST_STATUS",
+        "RECORD_LAST_UPDATED",
+        "REQUEST_ACCEPTED_TIMESTAMP",
+        "REQUEST_COMPLETED_TIMESTAMP",
+        "REQUEST_COMPLETION_DURATION",
+        "REQUEST_COMPLETION_ALERT_SENT",
+        "TOTAL_RECORDS_TRANSFERRED"
+    ]
+    
+    try:
+        # --- 1. Input Validation ---
+        db_name = config.get("pipeline_tracking_db")
+        schema_name = config.get("pipeline_tracking_sch")
+        table_name = config.get("pipeline_backfill_tbl")
+        
+        # Get WHERE clause keys from the details dict
+        request_id = back_fill_details.get("REQUEST_ID")
+        pipeline_id = back_fill_details.get("PIPELINE_ID")
+
+        if not all([db_name, schema_name, table_name, request_id, pipeline_id]):
+            err_msg = (
+                "Missing one or more required keys/inputs: 'pipeline_tracking_db', "
+                "'pipeline_tracking_sch', 'pipeline_backfill_tbl', "
+                "or 'REQUEST_ID'/'PIPELINE_ID' in back_fill_details."
+            )
+            logger.error(err_msg, tag=log_tag)
+            return_val["error"] = {"message": err_msg, "source": log_tag}
+            return return_val
+
+        fully_qualified_name = f"{db_name}.{schema_name}.{table_name}"
+
+        # --- 2. Dynamically build SET clause ---
+        set_clauses = []
+        print_set_clauses = []
+        parms = {
+            "where_req_id": request_id,
+            "where_pipe_id": pipeline_id
+        }
+
+        for col in UPDATABLE_COLUMNS:
+            if col in back_fill_details:
+                val = back_fill_details[col]
+                param_name = f"set_{col.lower()}"  # e.g., "set_request_status"
+                
+                # Add to query parameter list
+                set_clauses.append(f"{col} = %({param_name})s")
+                parms[param_name] = val
+                
+                # Add to print string list
+                print_val = f"'{val}'" if isinstance(val, str) else str(val)
+                print_set_clauses.append(f"{col} = {print_val}")
+        
+        if not set_clauses:
+            logger.warning(
+                "No updatable columns found in 'back_fill_details'. No update will be performed.",
+                tag=log_tag,
+                details={"request_id": request_id}
+            )
+            return_val["continue_dag_run"] = True
+            return return_val
+
+        # --- 3. Get Connection ---
+        conn_result = get_snowflake_connection(config, logger)
+        conn = conn_result.get('conn')
+        if conn_result.get('error'):
+            logger.error(f"Failed to connect to Snowflake.", tag=log_tag, details=conn_result['error'])
+            return_val["error"] = conn_result['error']
+            return return_val
+        
+        with conn.cursor(DictCursor) as cursor:
+            cursor.execute(f"USE DATABASE {db_name}")
+            cursor.execute(f"USE SCHEMA {schema_name}")
+            
+            # --- 4. Finalize and Print SQL ---
+            set_sql_str = ", ".join(set_clauses)
+            update_sql = f"""
+            UPDATE {fully_qualified_name}
+            SET {set_sql_str}
+            WHERE REQUEST_ID = %(where_req_id)s AND PIPELINE_ID = %(where_pipe_id)s
+            """
+
+            print_set_sql_str = ", ".join(print_set_clauses)
+            print_sql = f"""
+            UPDATE {fully_qualified_name}
+            SET {print_set_sql_str}
+            WHERE REQUEST_ID = '{request_id}' AND PIPELINE_ID = '{pipeline_id}'
+            """
+            print(print_sql)
+
+            # --- 5. Execute ---
+            logger.info(f"Executing dynamic UPDATE for {request_id}...", tag=log_tag)
+            cursor.execute(update_sql, parms)
+            query_id = cursor.sfqid
+            rows_updated = cursor.rowcount
+            
+            if rows_updated == 0:
+                logger.warning(
+                    f"No row found with REQUEST_ID {request_id}. No update performed.",
+                    tag=log_tag,
+                    details={"query_id": query_id}
+                )
+            else:
+                logger.info(
+                    f"Successfully updated {rows_updated} row(s).",
+                    tag=log_tag,
+                    details={"query_id": query_id}
+                )
+
+        # --- 6. Success ---
+        return_val["continue_dag_run"] = True
+        return return_val
+        
+    except snowflake.connector.Error as e:
+        error_details = {"message": e.msg, "errno": e.errno, "sqlstate": e.sqlstate, "sfqid": e.sfqid}
+        logger.error("A Snowflake error occurred.", tag=log_tag, details=error_details)
+        return_val["error"] = error_details
+        return return_val
+        
+    except Exception as e:
+        error_details = {"message": f"A non-Snowflake error occurred: {e}", "error_type": type(e).__name__}
+        logger.error("An unexpected error occurred.", tag=log_tag, details=error_details)
+        return_val["error"] = error_details
+        return return_val
+        
+    finally:
+        if conn:
+            conn.close()
+            logger.info("Snowflake connection closed.", tag=log_tag)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

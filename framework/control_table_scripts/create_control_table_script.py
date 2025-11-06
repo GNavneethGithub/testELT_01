@@ -246,7 +246,7 @@ def create_backfill_table(config: Dict[str, Any], logger: CustomLogger) -> Dict[
                             TOTAL_RECORDS_TRANSFERRED INT
                         )
         """
-        
+       
         return _execute_create_table(
             create_sql, fully_qualified_name, db_name, schema_name, config, logger, log_tag
         )
